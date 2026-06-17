@@ -1,10 +1,11 @@
-import React, { useState, useMemo } from "react";
+import React, { useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ScatterChart, Scatter, ReferenceLine,
   LabelList, LineChart, Line,
 } from "recharts";
 import { Zap, TrendingDown, ChevronDown, Check } from "lucide-react";
+import { getDataMode, useJouleData } from "./data/useJouleData";
 
 const C = {
   bg: "#12151b",
@@ -23,57 +24,6 @@ const C = {
 const MONO = '"IBM Plex Mono", "SFMono-Regular", monospace';
 const SANS = '"IBM Plex Sans", "Inter", sans-serif';
 
-const LOAD = [0.22,0.18,0.15,0.14,0.16,0.20,0.28,0.42,0.58,0.72,0.84,0.92,0.97,1.00,0.98,0.94,0.88,0.80,0.68,0.55,0.42,0.34,0.28,0.24];
-const HOURS = LOAD.map((_, h) => `${String(h).padStart(2, "0")}:00`);
-
-const BASE_POWER = LOAD.map((load, h) => {
-  const prefillKW = Math.round(load * 950 + 150);
-  const decodeTotalKW = Math.round(load * 1550 + 250);
-  const decodeWastedKW = Math.round(decodeTotalKW * 0.40);
-  return {
-    hour: HOURS[h],
-    prefillKW,
-    decodeNeededKW: decodeTotalKW - decodeWastedKW,
-    decodeWastedKW,
-  };
-});
-
-const LEADERBOARD = [
-  { tenant: "Acme Labs", model: "Llama-3.1-70B-Instruct", batch: 34, jpt: 3.9, wasted: 8210 },
-  { tenant: "Globex AI", model: "Mixtral-8x22B", batch: 21, jpt: 4.6, wasted: 6040 },
-  { tenant: "Initech", model: "Qwen2.5-72B", batch: 18, jpt: 4.1, wasted: 4380 },
-  { tenant: "Soylent Data", model: "DeepSeek-V3", batch: 12, jpt: 5.2, wasted: 3190 },
-  { tenant: "Hooli Infra", model: "Llama-3.1-8B (high-QPS)", batch: 64, jpt: 1.8, wasted: 2540 },
-  { tenant: "Stark Compute", model: "Command-R+", batch: 15, jpt: 3.4, wasted: 2140 },
-];
-
-const SCATTER_CURRENT = [
-  { name: "Llama-70B", latency: 2180, energy: 3.9 },
-  { name: "Mixtral-8x22B", latency: 2390, energy: 4.6 },
-  { name: "Qwen2.5-72B", latency: 1950, energy: 4.1 },
-  { name: "DeepSeek-V3", latency: 2340, energy: 5.2 },
-  { name: "Llama-8B", latency: 980, energy: 1.8 },
-  { name: "Command-R+", latency: 2050, energy: 3.4 },
-];
-
-const SCATTER_PROJECTED = [
-  { name: "Llama-70B", latency: 2350, energy: 2.6 },
-  { name: "Mixtral-8x22B", latency: 2480, energy: 3.1 },
-  { name: "Qwen2.5-72B", latency: 2200, energy: 2.7 },
-  { name: "DeepSeek-V3", latency: 2490, energy: 3.4 },
-  { name: "Llama-8B", latency: 1050, energy: 1.3 },
-  { name: "Command-R+", latency: 2300, energy: 2.2 },
-];
-
-const TREND = [88200, 91400, 93800, 97650, 101200, 103900, 105100, 106640].map((v, i) => ({ i, v }));
-
-const RECS = [
-  { title: "Drop decode clock speed 18% for Llama-3.1-70B, 12am\u20136am", detail: "Batch sizes stay below the threshold where higher clocks help. Backtested across 30 days of traffic.", savings: 3860, risk: "none", riskLabel: "0 SLO breaches in backtest" },
-  { title: "Move Mixtral-8x22B decode workers to a lower power-state profile", detail: "Memory-bound generation rarely needs peak frequency. Tested against the P99 latency target.", savings: 2910, risk: "low", riskLabel: "99.97% SLO attainment maintained" },
-  { title: "Right-size the batch ceiling for Hooli Infra's high-QPS 8B model", detail: "Current ceiling leaves 1,520ms of unused latency budget at P99.", savings: 1640, risk: "none", riskLabel: "0 SLO breaches in backtest" },
-  { title: "Shift Qwen2.5-72B prefill to a reserved power tier overnight", detail: "Requires enabling the power oversubscription policy on the orchestrator.", savings: 1980, risk: "medium", riskLabel: "Needs oversubscription policy" },
-];
-
 const fmtUSD = (n) => "$" + Math.round(n).toLocaleString("en-US");
 
 function CustomTooltip({ active, payload, label }) {
@@ -91,31 +41,17 @@ function CustomTooltip({ active, payload, label }) {
   );
 }
 
+function dataSourceLabel(status) {
+  if (status.mode === "live") return status.coreReachable ? "live · joule-core" : "live · mock fallback";
+  if (status.mode === "shadow") return status.shadowOk ? "shadow · core ok" : "shadow · mock";
+  return "mock";
+}
+
 export default function JouleDashboard() {
   const [optimized, setOptimized] = useState(false);
-
-  const powerData = useMemo(
-    () => BASE_POWER.map((d) => ({ ...d, decodeWastedKW: optimized ? Math.round(d.decodeWastedKW * 0.15) : d.decodeWastedKW })),
-    [optimized]
-  );
-
-  const totals = useMemo(() => {
-    const n = powerData.length;
-    const avg = (k) => powerData.reduce((s, d) => s + d[k], 0) / n;
-    const avgTotal = avg("prefillKW") + avg("decodeNeededKW") + avg("decodeWastedKW");
-    const avgWasted = avg("decodeWastedKW");
-    const rate = 0.085;
-    const monthlySpend = avgTotal * 720 * rate;
-    const monthlyWasted = avgWasted * 720 * rate;
-    const wastedPct = (monthlyWasted / monthlySpend) * 100;
-    return { monthlySpend, monthlyWasted, wastedPct, usefulPct: 100 - wastedPct };
-  }, [powerData]);
-
-  const STATS = [
-    { label: "J / TOKEN \u00b7 FLEET AVG", value: optimized ? "1.6 J" : "3.8 J", sub: optimized ? "near optimal range" : "vs 1.4\u20131.8 J achievable" },
-    { label: "SLO ATTAINMENT", value: optimized ? "99.98%" : "99.96%", sub: "p99 \u2264 2,500ms" },
-    { label: "ACTIVE GPUs", value: "3,140", sub: "H100 \u00d72,400 \u00b7 A100 \u00d7740" },
-  ];
+  const { snapshot, status } = useJouleData(optimized);
+  const { power: powerData, leaderboard: LEADERBOARD, scatter, trend: TREND, recommendations: RECS, totals, stats: STATS, totalIdentifiedSavings } = snapshot;
+  const { current: SCATTER_CURRENT, projected: SCATTER_PROJECTED } = scatter;
 
   return (
     <div style={{ background: C.bg, color: C.ink, fontFamily: SANS, minHeight: "100vh" }}>
@@ -143,7 +79,7 @@ export default function JouleDashboard() {
               All clusters <ChevronDown size={13} />
             </div>
             <div className="px-3 py-1.5 rounded-lg" style={{ background: C.panel, border: `1px solid ${C.border}`, fontSize: 12, fontFamily: MONO, color: C.inkSoft }}>
-              Jun 1 \u2013 17, 2026
+              Jun 1 – 17, 2026
             </div>
           </div>
         </header>
@@ -151,7 +87,7 @@ export default function JouleDashboard() {
         {/* hero */}
         <section className="mt-6 rounded-2xl p-6 flex flex-wrap items-start justify-between gap-8" style={{ background: C.panel, border: `1px solid ${C.border}` }}>
           <div style={{ flex: "1 1 420px" }}>
-            <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: "0.1em", color: C.inkFaint }}>POWER SPEND \u00b7 THIS BILLING CYCLE</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: "0.1em", color: C.inkFaint }}>POWER SPEND · THIS BILLING CYCLE</div>
             <div className="flex items-baseline gap-3 mt-2">
               <span style={{ fontFamily: MONO, fontSize: 44, fontWeight: 600, transition: "color 300ms" }}>{fmtUSD(totals.monthlySpend)}</span>
               <span style={{ fontSize: 13, color: C.inkSoft }}>/ month</span>
@@ -160,8 +96,8 @@ export default function JouleDashboard() {
               <span style={{ width: 8, height: 8, borderRadius: 4, background: optimized ? C.sage : C.amber, flexShrink: 0 }} />
               <span style={{ fontFamily: MONO, fontSize: 13, color: optimized ? C.sage : C.amber }}>
                 {optimized
-                  ? `${fmtUSD(totals.monthlyWasted)} still in play \u2014 ${totals.wastedPct.toFixed(1)}%`
-                  : `${fmtUSD(totals.monthlyWasted)} recoverable \u2014 ${totals.wastedPct.toFixed(1)}% of spend`}
+                  ? `${fmtUSD(totals.monthlyWasted)} still in play — ${totals.wastedPct.toFixed(1)}%`
+                  : `${fmtUSD(totals.monthlyWasted)} recoverable — ${totals.wastedPct.toFixed(1)}% of spend`}
               </span>
             </div>
 
@@ -172,8 +108,8 @@ export default function JouleDashboard() {
               </div>
             </div>
             <div className="flex gap-4 mt-2" style={{ fontSize: 11, fontFamily: MONO, color: C.inkFaint }}>
-              <span><span style={{ color: C.teal }}>\u25a0</span> useful work</span>
-              <span><span style={{ color: C.amber }}>\u25a0</span> {optimized ? "residual waste" : "wasted"}</span>
+              <span><span style={{ color: C.teal }}>■</span> useful work</span>
+              <span><span style={{ color: C.amber }}>■</span> {optimized ? "residual waste" : "wasted"}</span>
             </div>
 
             <div className="flex items-center gap-3 mt-4">
@@ -185,7 +121,7 @@ export default function JouleDashboard() {
                 </ResponsiveContainer>
               </div>
               <div style={{ fontSize: 11, fontFamily: MONO, color: C.inkFaint }}>
-                8-wk trend <span style={{ color: C.amber }}>\u25b2 3.1%</span> vs last week
+                8-wk trend <span style={{ color: C.amber }}>▲ 3.1%</span> vs last week
               </div>
             </div>
           </div>
@@ -215,10 +151,10 @@ export default function JouleDashboard() {
         <section className="mt-6 rounded-2xl p-6" style={{ background: C.panel, border: `1px solid ${C.border}` }}>
           <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
             <div style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600 }}>Power draw by inference phase</div>
-            <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkFaint }}>LAST 24H \u00b7 KW</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkFaint }}>LAST 24H · KW</div>
           </div>
           <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 12 }}>
-            The {optimized ? "thin" : "wide"} amber band is decode running at full clock speed while it waits on memory \u2014 power that isn\u2019t increasing throughput.
+            The {optimized ? "thin" : "wide"} amber band is decode running at full clock speed while it waits on memory — power that isn’t increasing throughput.
           </div>
           <div style={{ height: 260 }}>
             <ResponsiveContainer width="100%" height="100%">
@@ -243,14 +179,14 @@ export default function JouleDashboard() {
             <div className="flex flex-col gap-3">
               {LEADERBOARD.map((row) => {
                 const max = LEADERBOARD[0].wasted;
-                const val = optimized ? row.wasted * 0.15 : row.wasted;
+                const val = row.wasted;
                 const pct = (val / max) * 100;
                 return (
                   <div key={row.model}>
                     <div className="flex items-baseline justify-between flex-wrap gap-1">
                       <div>
                         <span style={{ fontSize: 13 }}>{row.tenant}</span>
-                        <span style={{ fontSize: 12, color: C.inkFaint }}> \u00b7 {row.model}</span>
+                        <span style={{ fontSize: 12, color: C.inkFaint }}> · {row.model}</span>
                       </div>
                       <span style={{ fontFamily: MONO, fontSize: 13, color: optimized ? C.sage : C.amber }}>{fmtUSD(val)}/mo</span>
                     </div>
@@ -259,7 +195,7 @@ export default function JouleDashboard() {
                     </div>
                     <div className="flex gap-4 mt-1" style={{ fontSize: 11, fontFamily: MONO, color: C.inkFaint }}>
                       <span>batch {row.batch}</span>
-                      <span>{row.jpt} J/tok</span>
+                      <span>{row.jpt.toFixed(1)} J/tok</span>
                     </div>
                   </div>
                 );
@@ -286,8 +222,8 @@ export default function JouleDashboard() {
               </ResponsiveContainer>
             </div>
             <div className="flex gap-4 mt-2" style={{ fontSize: 11, fontFamily: MONO, color: C.inkFaint }}>
-              <span><span style={{ color: C.amber }}>\u25cf</span> current</span>
-              <span><span style={{ color: C.teal }}>\u25cf</span> achievable within SLO</span>
+              <span><span style={{ color: C.amber }}>●</span> current</span>
+              <span><span style={{ color: C.teal }}>●</span> achievable within SLO</span>
             </div>
           </div>
         </section>
@@ -296,7 +232,7 @@ export default function JouleDashboard() {
         <section className="mt-6 rounded-2xl p-6" style={{ background: C.panel, border: `1px solid ${C.border}` }}>
           <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
             <div style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600 }}>Recommended actions</div>
-            <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkFaint }}>{fmtUSD(RECS.reduce((s, r) => s + r.savings, 0))}/MO IDENTIFIED</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkFaint }}>{fmtUSD(totalIdentifiedSavings)}/MO IDENTIFIED</div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {RECS.map((r, i) => (
@@ -321,9 +257,9 @@ export default function JouleDashboard() {
         <footer className="mt-6 flex items-center justify-between flex-wrap gap-2 py-4" style={{ borderTop: `1px solid ${C.border}`, fontSize: 11, fontFamily: MONO, color: C.inkFaint }}>
           <div className="flex items-center gap-2">
             <span className="animate-pulse" style={{ width: 6, height: 6, borderRadius: 3, background: C.sage, display: "inline-block" }} />
-            Synced with vLLM cluster \u00b7 3,140 GPUs \u00b7 4 regions
+            Synced with vLLM cluster · 3,140 GPUs · 4 regions
           </div>
-          <div>Last updated 2 min ago</div>
+          <div>{dataSourceLabel(status)} · mode {getDataMode()}</div>
         </footer>
       </div>
     </div>
